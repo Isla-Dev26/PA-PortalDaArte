@@ -1,11 +1,25 @@
 from datetime import datetime, timedelta, timezone
 import os
 import traceback
+import hashlib
+import hmac
+import html
+import logging
+import re
+import secrets
+import smtplib
+import ssl
+import threading
+import time
+from collections import deque
+from email.message import EmailMessage
+from email.utils import formataddr
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import jwt
 import mysql.connector
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field
@@ -72,7 +86,7 @@ def get_db_connection():
     return mysql.connector.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", "root"),
+        password=os.getenv("DB_PASSWORD", ""),
         database=os.getenv("DB_NAME", "portal_da_arte")
     )
 
@@ -176,7 +190,197 @@ class AvaliacaoCreate(BaseModel):
     comentario: Optional[str] = None
 
 class RecuperarSenhaRequest(BaseModel):
-    email: str
+    email: str = Field(..., min_length=3, max_length=255)
+
+class RedefinirSenhaRequest(BaseModel):
+    token: str = Field(..., min_length=1, max_length=256)
+    nova_senha: str = Field(..., min_length=8, max_length=72)
+
+
+# ============================================================
+# RECUPERAÇÃO DE SENHA (SMTP E TOKENS DE USO ÚNICO)
+# ============================================================
+
+logger = logging.getLogger(__name__)
+RECUPERACAO_EXPIRA_MINUTOS = 30
+RECUPERACAO_MENSAGEM = (
+    "Se o e-mail informado estiver cadastrado, você receberá um link "
+    "com as instruções para redefinir sua senha."
+)
+_recuperacao_por_ip = {}
+_recuperacao_lock = threading.Lock()
+_recuperacao_ultima_limpeza = 0.0
+
+
+def carregar_config_recuperacao():
+    """Valida a configuração antes de aceitar qualquer endereço de e-mail."""
+    config = {
+        "host": os.getenv("SMTP_HOST", "").strip(),
+        "username": os.getenv("SMTP_USERNAME", "").strip(),
+        "password": os.getenv("SMTP_PASSWORD", ""),
+        "from_email": os.getenv("SMTP_FROM_EMAIL", "").strip(),
+        "from_name": os.getenv("SMTP_FROM_NAME", "Portal da Arte").strip(),
+        "security": os.getenv("SMTP_SECURITY", "starttls").strip().lower(),
+        "reset_url": os.getenv("PASSWORD_RESET_URL", "").strip(),
+    }
+    if not all(config[key] for key in ("host", "username", "password", "from_email", "reset_url")):
+        raise ValueError("Configuração de recuperação incompleta")
+    if config["security"] not in ("starttls", "ssl"):
+        raise ValueError("SMTP precisa de STARTTLS ou SSL")
+    config["port"] = int(os.getenv("SMTP_PORT", "465" if config["security"] == "ssl" else "587"))
+    config["timeout"] = float(os.getenv("SMTP_TIMEOUT_SECONDS", "15"))
+    if not 1 <= config["port"] <= 65535 or not 1 <= config["timeout"] <= 60:
+        raise ValueError("Porta ou timeout SMTP inválido")
+    if any("\r" in str(value) or "\n" in str(value) for value in config.values()):
+        raise ValueError("Configuração de recuperação inválida")
+    if not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", config["from_email"]):
+        raise ValueError("Remetente SMTP inválido")
+    url = urlsplit(config["reset_url"])
+    # A propriedade port também rejeita portas não numéricas e fora do intervalo.
+    porta_url = url.port
+    if porta_url is not None and porta_url < 1:
+        raise ValueError("Porta da URL de recuperação inválida")
+    if (not url.hostname or url.username or url.password or url.fragment
+            or re.search(r"\s", config["reset_url"])):
+        raise ValueError("URL de recuperação inválida")
+    if url.scheme != "https" and not (
+        url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1")
+    ):
+        raise ValueError("URL pública de recuperação precisa de HTTPS")
+    return config
+
+
+def limitar_recuperacao_por_ip(endereco_ip):
+    """Limite local ao processo; em múltiplos workers, usar também o proxy."""
+    global _recuperacao_ultima_limpeza
+    agora = time.monotonic()
+    inicio_janela = agora - 15 * 60
+    with _recuperacao_lock:
+        if agora - _recuperacao_ultima_limpeza >= 60 or len(_recuperacao_por_ip) >= 10000:
+            expirados = [ip for ip, tentativas in _recuperacao_por_ip.items()
+                         if not tentativas or tentativas[-1] <= inicio_janela]
+            for ip in expirados:
+                del _recuperacao_por_ip[ip]
+            _recuperacao_ultima_limpeza = agora
+        tentativas = _recuperacao_por_ip.get(endereco_ip)
+        if tentativas is None:
+            if len(_recuperacao_por_ip) >= 10000:
+                raise HTTPException(status_code=429, detail="Muitas solicitações. Tente novamente mais tarde.")
+            tentativas = deque()
+            _recuperacao_por_ip[endereco_ip] = tentativas
+        while tentativas and tentativas[0] <= inicio_janela:
+            tentativas.popleft()
+        if len(tentativas) >= 10:
+            raise HTTPException(status_code=429, detail="Muitas solicitações. Tente novamente mais tarde.")
+        tentativas.append(agora)
+
+
+def enviar_email_recuperacao(config, email, token):
+    url = urlsplit(config["reset_url"])
+    parametros = [(chave, valor) for chave, valor in parse_qsl(url.query, keep_blank_values=True)
+                  if chave != "token"]
+    parametros.append(("token", token))
+    link = urlunsplit((url.scheme, url.netloc, url.path, urlencode(parametros), ""))
+    mensagem = EmailMessage()
+    mensagem["Subject"] = "Redefina sua senha - Portal da Arte"
+    mensagem["From"] = formataddr((config["from_name"], config["from_email"]))
+    mensagem["To"] = email
+    mensagem.set_content(
+        "Olá!\n\nRecebemos uma solicitação para redefinir sua senha no Portal da Arte.\n"
+        f"Acesse o link abaixo, válido por {RECUPERACAO_EXPIRA_MINUTOS} minutos e para um único uso:\n\n"
+        f"{link}\n\nSe você não fez esta solicitação, ignore este e-mail. "
+        "Sua senha só será alterada quando você confirmar uma nova senha.\n"
+    )
+    mensagem.add_alternative(
+        "<html><body><p>Olá!</p><p>Recebemos uma solicitação para redefinir sua senha "
+        "no Portal da Arte.</p>"
+        f'<p><a href="{html.escape(link, quote=True)}">Redefinir minha senha</a></p>'
+        f"<p>O link é válido por {RECUPERACAO_EXPIRA_MINUTOS} minutos e para um único uso.</p>"
+        "<p>Se você não fez esta solicitação, ignore este e-mail. "
+        "Sua senha só será alterada quando você confirmar uma nova senha.</p></body></html>",
+        subtype="html",
+    )
+    contexto_tls = ssl.create_default_context()
+    if config["security"] == "ssl":
+        servidor = smtplib.SMTP_SSL(config["host"], config["port"],
+                                   timeout=config["timeout"], context=contexto_tls)
+    else:
+        servidor = smtplib.SMTP(config["host"], config["port"], timeout=config["timeout"])
+    with servidor:
+        servidor.ehlo()
+        if config["security"] == "starttls":
+            servidor.starttls(context=contexto_tls)
+            servidor.ehlo()
+        servidor.login(config["username"], config["password"])
+        recusados = servidor.send_message(mensagem)
+        if recusados:
+            raise smtplib.SMTPRecipientsRefused(recusados)
+
+
+def processar_recuperacao_senha(email, config):
+    """O trabalho com banco/SMTP ocorre após a resposta neutra ao solicitante."""
+    conexao = None
+    cursor = None
+    token_id = None
+    try:
+        conexao = get_db_connection()
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, email FROM usuarios WHERE email_normalizado = LOWER(%s) "
+            "AND status IN ('ativo', 'pendente_verificacao') FOR UPDATE",
+            (email,),
+        )
+        usuario = cursor.fetchone()
+        if not usuario:
+            return
+        # O bloqueio do usuário serializa o limite da conta entre processos.
+        cursor.execute(
+            "SELECT COUNT(*) AS total_hora, "
+            "SUM(criado_em > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 SECOND)) AS total_minuto "
+            "FROM tokens_usuario WHERE usuario_id = %s AND tipo = 'redefinicao_senha' "
+            "AND criado_em > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)",
+            (usuario["id"],),
+        )
+        limites = cursor.fetchone()
+        if limites["total_hora"] >= 5 or (limites["total_minuto"] or 0) >= 1:
+            return
+        token = secrets.token_urlsafe(32)
+        hash_token = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cursor.execute(
+            "INSERT INTO tokens_usuario (usuario_id, tipo, hash_token, expira_em, criado_em) "
+            "VALUES (%s, 'redefinicao_senha', %s, "
+            "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE), UTC_TIMESTAMP())",
+            (usuario["id"], hash_token),
+        )
+        token_id = cursor.lastrowid
+        conexao.commit()
+        # Links anteriores continuam válidos até um reset ter sido concluído.
+        enviar_email_recuperacao(config, usuario["email"], token)
+    except Exception as err:
+        if conexao:
+            try:
+                conexao.rollback()
+                if token_id is not None:
+                    cursor.execute(
+                        "DELETE FROM tokens_usuario WHERE id = %s "
+                        "AND tipo = 'redefinicao_senha' AND usado_em IS NULL",
+                        (token_id,),
+                    )
+                    conexao.commit()
+            except Exception:
+                logger.error("Não foi possível remover um token de recuperação após falha de envio.")
+        # Não registrar destinatário, token, senha, credenciais ou exceção completa.
+        logger.error("Falha no processamento da recuperação de senha (%s).", type(err).__name__)
+    finally:
+        if cursor:
+            cursor.close()
+        if conexao:
+            conexao.close()
+
+
+def versao_senha(senha_hash):
+    """Vincula JWTs à credencial atual sem expor o hash bcrypt nos tokens."""
+    return hmac.new(SECRET_KEY.encode("utf-8"), senha_hash.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # ============================================================
@@ -186,7 +390,8 @@ class RecuperarSenhaRequest(BaseModel):
 def criar_access_token(
     usuario_id: int,
     email: str,
-    status_usuario: str
+    status_usuario: str,
+    senha_hash: str
 ):
     expiracao = (
         datetime.now(timezone.utc)
@@ -198,6 +403,7 @@ def criar_access_token(
         "email": email,
         "status": status_usuario,
         "type": "access",
+        "pwdv": versao_senha(senha_hash),
         "exp": expiracao
     }
 
@@ -211,7 +417,8 @@ def criar_access_token(
 
 
 def criar_refresh_token(
-    usuario_id: int
+    usuario_id: int,
+    senha_hash: str
 ):
     expiracao = (
         datetime.now(timezone.utc)
@@ -221,6 +428,7 @@ def criar_refresh_token(
     payload = {
         "sub": str(usuario_id),
         "type": "refresh",
+        "pwdv": versao_senha(senha_hash),
         "exp": expiracao
     }
 
@@ -238,38 +446,39 @@ def get_usuario_atual(
 ):
     credenciais_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Token inválido ou expirado",
-        headers={
-            "WWW-Authenticate": "Bearer"
-        }
+        detail="Token inválido ou expirado. Entre novamente.",
+        headers={"WWW-Authenticate": "Bearer"}
     )
-
+    conexao = None
+    cursor = None
     try:
-        payload = jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM]
-        )
-
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         usuario_id = payload.get("sub")
-        email = payload.get("email")
-        tipo = payload.get("type")
-
-        if usuario_id is None or tipo != "access":
+        versao = payload.get("pwdv")
+        if usuario_id is None or payload.get("type") != "access" or not isinstance(versao, str):
             raise credenciais_exception
-
-        return {
-            "id": int(usuario_id),
-            "email": email
-        }
-
+        conexao = get_db_connection()
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute("SELECT email, senha_hash, status FROM usuarios WHERE id = %s", (int(usuario_id),))
+        usuario = cursor.fetchone()
+        if (not usuario or usuario["status"] not in ('ativo', 'pendente_verificacao')
+                or not hmac.compare_digest(versao, versao_senha(usuario["senha_hash"]))):
+            raise credenciais_exception
+        return {"id": int(usuario_id), "email": usuario["email"]}
     except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token expirado"
-        )
-    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except (jwt.InvalidTokenError, ValueError, TypeError):
         raise credenciais_exception
+    except HTTPException:
+        raise
+    except Exception as err:
+        logger.error("Falha ao validar sessão (%s).", type(err).__name__)
+        raise HTTPException(status_code=503, detail="Não foi possível validar a sessão. Tente novamente.")
+    finally:
+        if cursor:
+            cursor.close()
+        if conexao:
+            conexao.close()
 
 
 # ============================================================
@@ -402,11 +611,13 @@ def login(request: LoginRequest):
         access_token = criar_access_token(
             usuario_encontrado["id"],
             usuario_encontrado["email"],
-            usuario_encontrado["status"]
+            usuario_encontrado["status"],
+            usuario_encontrado["senha_hash"]
         )
 
         refresh_token = criar_refresh_token(
-            usuario_encontrado["id"]
+            usuario_encontrado["id"],
+            usuario_encontrado["senha_hash"]
         )
 
         return {
@@ -439,34 +650,80 @@ def login(request: LoginRequest):
 
 
 @app.post("/api/recuperar-senha", tags=["Auth"])
-def recuperar_senha(request: RecuperarSenhaRequest):
+def recuperar_senha(request: RecuperarSenhaRequest, background_tasks: BackgroundTasks, http_request: Request):
+    email = request.email.strip().lower()
+    if not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", email):
+        raise HTTPException(status_code=422, detail="Informe um e-mail válido.")
+    try:
+        config = carregar_config_recuperacao()
+    except (ValueError, TypeError):
+        logger.error("Configuração de recuperação de senha ausente ou inválida.")
+        raise HTTPException(status_code=503, detail="Recuperação de senha temporariamente indisponível. Tente novamente mais tarde.")
+    limitar_recuperacao_por_ip(http_request.client.host if http_request.client else "desconhecido")
+    background_tasks.add_task(processar_recuperacao_senha, email, config)
+    return {"status": "sucesso", "mensagem": RECUPERACAO_MENSAGEM}
+
+
+@app.post("/api/redefinir-senha", tags=["Auth"])
+def redefinir_senha(request: RedefinirSenhaRequest):
+    if not request.nova_senha.strip():
+        raise HTTPException(status_code=422, detail="A senha não pode conter apenas espaços.")
+    if len(request.nova_senha.encode("utf-8")) > 72:
+        raise HTTPException(status_code=422, detail="A senha deve ter no máximo 72 bytes em UTF-8. Reduza seu tamanho.")
+    erro_token = HTTPException(status_code=400, detail="Link inválido ou expirado. Solicite uma nova recuperação de senha.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", request.token):
+        raise erro_token
+    hash_token = hashlib.sha256(request.token.encode("utf-8")).hexdigest()
     conexao = None
     cursor = None
     try:
         conexao = get_db_connection()
         cursor = conexao.cursor(dictionary=True)
-
-        query = "SELECT id, email FROM usuarios WHERE email_normalizado = LOWER(%s)"
-        cursor.execute(query, (request.email.strip(),))
-        usuario = cursor.fetchone()
-
-        if usuario:
-            print(f"[RECUPERAÇÃO DE SENHA] E-mail encontrado para o ID: {usuario['id']}.")
-
-        return {
-            "status": "sucesso",
-            "mensagem": "Se o e-mail informado estiver cadastrado, você receberá um link com as instruções para redefinir sua senha."
-        }
-    except Exception as err:
-        print("--- ERRO NA RECUPERAÇÃO DE SENHA ---")
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro interno no servidor: {str(err)}"
+        cursor.execute(
+            "SELECT usuario_id FROM tokens_usuario WHERE hash_token = %s "
+            "AND tipo = 'redefinicao_senha' LIMIT 1", (hash_token,),
         )
+        candidato = cursor.fetchone()
+        if not candidato:
+            raise erro_token
+        # A mesma ordem de locks na emissão e no consumo impede uso concorrente.
+        cursor.execute("SELECT id, status FROM usuarios WHERE id = %s FOR UPDATE", (candidato["usuario_id"],))
+        usuario = cursor.fetchone()
+        if not usuario or usuario["status"] not in ('ativo', 'pendente_verificacao'):
+            raise erro_token
+        cursor.execute(
+            "SELECT id FROM tokens_usuario WHERE usuario_id = %s AND hash_token = %s "
+            "AND tipo = 'redefinicao_senha' AND usado_em IS NULL "
+            "AND expira_em > UTC_TIMESTAMP() FOR UPDATE", (usuario["id"], hash_token),
+        )
+        if not cursor.fetchone():
+            raise erro_token
+        senha_hash = hash_senha(request.nova_senha)
+        cursor.execute("UPDATE usuarios SET senha_hash = %s WHERE id = %s", (senha_hash, usuario["id"]))
+        cursor.execute(
+            "UPDATE tokens_usuario SET usado_em = UTC_TIMESTAMP() WHERE usuario_id = %s "
+            "AND tipo = 'redefinicao_senha' AND usado_em IS NULL", (usuario["id"],),
+        )
+        cursor.execute(
+            "UPDATE sessoes SET revogado_em = UTC_TIMESTAMP() WHERE usuario_id = %s AND revogado_em IS NULL",
+            (usuario["id"],),
+        )
+        conexao.commit()
+        return {"status": "sucesso", "mensagem": "Senha redefinida com sucesso. Entre com sua nova senha."}
+    except HTTPException:
+        if conexao:
+            conexao.rollback()
+        raise
+    except Exception as err:
+        if conexao:
+            conexao.rollback()
+        logger.error("Falha ao redefinir senha (%s).", type(err).__name__)
+        raise HTTPException(status_code=500, detail="Não foi possível redefinir sua senha. Tente novamente.")
     finally:
-        if cursor: cursor.close()
-        if conexao: conexao.close()
+        if cursor:
+            cursor.close()
+        if conexao:
+            conexao.close()
 
 
 # ============================================================
@@ -477,69 +734,43 @@ def recuperar_senha(request: RecuperarSenhaRequest):
 def refresh_token(request: RefreshTokenRequest):
     credenciais_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Refresh token inválido ou expirado"
+        detail="Refresh token inválido ou expirado. Entre novamente."
     )
-
+    conexao = None
+    cursor = None
     try:
-        payload = jwt.decode(
-            request.refresh_token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM]
-        )
-
+        payload = jwt.decode(request.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
         usuario_id = payload.get("sub")
-        tipo = payload.get("type")
-
-        if usuario_id is None or tipo != "refresh":
+        versao = payload.get("pwdv")
+        if usuario_id is None or payload.get("type") != "refresh" or not isinstance(versao, str):
             raise credenciais_exception
-
         conexao = get_db_connection()
         cursor = conexao.cursor(dictionary=True)
-
-        query = """
-            SELECT
-                id,
-                email,
-                status
-            FROM usuarios
-            WHERE id = %s
-            AND status = 'ativo'
-        """
-
-        cursor.execute(query, (int(usuario_id),))
+        cursor.execute(
+            "SELECT id, email, status, senha_hash FROM usuarios WHERE id = %s AND status = 'ativo'",
+            (int(usuario_id),),
+        )
         usuario = cursor.fetchone()
-
-        cursor.close()
-        conexao.close()
-
-        if not usuario:
+        if not usuario or not hmac.compare_digest(versao, versao_senha(usuario["senha_hash"])):
             raise credenciais_exception
-
         novo_access_token = criar_access_token(
-            usuario["id"],
-            usuario["email"],
-            usuario["status"]
+            usuario["id"], usuario["email"], usuario["status"], usuario["senha_hash"]
         )
-
-        return {
-            "access_token": novo_access_token,
-            "token_type": "bearer"
-        }
-
+        return {"access_token": novo_access_token, "token_type": "bearer"}
     except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token expirado"
-        )
-    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Refresh token expirado")
+    except (jwt.InvalidTokenError, ValueError, TypeError):
         raise credenciais_exception
+    except HTTPException:
+        raise
     except Exception as err:
-        print("--- ERRO NO REFRESH TOKEN ---")
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro detalhado no servidor: {str(err)}"
-        )
+        logger.error("Falha ao renovar sessão (%s).", type(err).__name__)
+        raise HTTPException(status_code=500, detail="Não foi possível renovar a sessão. Tente novamente.")
+    finally:
+        if cursor:
+            cursor.close()
+        if conexao:
+            conexao.close()
 
 
 # ============================================================
