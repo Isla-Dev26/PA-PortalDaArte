@@ -12,6 +12,7 @@ import ssl
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from email.message import EmailMessage
 from email.utils import formataddr
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -19,15 +20,20 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import jwt
 import mysql.connector
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, status, Depends, BackgroundTasks, Request, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.responses import RedirectResponse
+from portfolio_storage import (
+    LimiteUploadPortfolioMiddleware, PortfolioStorageError, SupabasePortfolioStorage,
+    criar_caminho, ler_referencia, referencia_storage, validar_arquivo_portfolio,
+)
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import bcrypt
 
-# Carrega as variáveis de ambiente do arquivo .env
-load_dotenv()
+# Configuração ao lado da API; aceita BOM do Windows e preserva variáveis já exportadas.
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), encoding="utf-8-sig", override=False)
 
 app = FastAPI(
     title="Portal da Arte API",
@@ -38,6 +44,7 @@ app = FastAPI(
 # ============================================================
 # CONFIGURAÇÃO DE CORS (Essencial para React Native/Web)
 # ============================================================
+app.add_middleware(LimiteUploadPortfolioMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1589,38 +1596,73 @@ def atualizar_detalhes_artista(dados: DetalhesArtistaUpdate, current_user: dict 
         if conexao: conexao.close()
 
 
+def _erro_banco_portfolio(error, mensagem):
+    if isinstance(error, mysql.connector.Error) and error.errno in (1054, 1146, 1265):
+        return HTTPException(
+            status_code=503,
+            detail="Atualize o banco com BancoDeDados/migracao_portfolio_supabase.sql antes de usar os arquivos de portfólio.",
+        )
+    # Não registrar respostas HTTP, chaves, nomes pessoais ou URLs assinadas.
+    logger.error("Falha de persistência do portfólio (%s).", type(error).__name__)
+    return HTTPException(status_code=500, detail=mensagem)
+
+
+def _rollback_portfolio(conexao):
+    if conexao:
+        try:
+            conexao.rollback()
+        except Exception:
+            logger.error("Não foi possível confirmar o rollback do portfólio.")
+
+
+def _url_item_portfolio(referencia, item_id, artista_id, capa=False):
+    if not referencia:
+        return ""
+    if ler_referencia(referencia, artista_id):
+        return f"/api/portfolio/arquivos/{item_id}" + ("/capa" if capa else "")
+    # Mantém os itens de texto e links legados existentes no banco.
+    return referencia
+
+
 @app.get("/api/artistas/{artista_id}/portfolio", tags=["Artista"])
 def listar_portfolio_publico(artista_id: int):
-    """Retorna os itens publicados do portfólio de um artista."""
+    """Itens publicados, com links estáveis; a assinatura é gerada ao abrir a mídia."""
     conexao = None
     cursor = None
     try:
         conexao = get_db_connection()
         cursor = conexao.cursor(dictionary=True)
         cursor.execute("""
-            SELECT p.id, p.titulo, p.descricao, p.tipo, p.ordem,
+            SELECT p.id, p.artista_id, p.titulo, p.descricao, p.tipo, p.ordem,
                    i.id AS item_id, i.tipo_midia, i.midia_url, i.titulo AS item_titulo,
-                   i.descricao AS item_descricao
+                   i.descricao AS item_descricao, i.arquivo_nome, i.arquivo_mime,
+                   i.arquivo_tamanho, i.secao, i.capa_url
             FROM portfolios p
             LEFT JOIN itens_portfolio i ON i.portfolio_id = p.id
             WHERE p.artista_id = %s AND p.publicado = TRUE
             ORDER BY p.ordem ASC, p.criado_em DESC, i.ordem ASC, i.criado_em ASC
         """, (artista_id,))
-        rows = cursor.fetchall()
         items = []
-        for row in rows:
+        for row in cursor.fetchall():
             items.append({
                 "id": row["item_id"] or row["id"],
                 "portfolio_id": row["id"],
+                "item_id": row["item_id"],
                 "titulo": row["item_titulo"] or row["titulo"],
                 "descricao": row["item_descricao"] or row["descricao"] or "",
                 "tipo": row["tipo_midia"] or row["tipo"],
-                "midia_url": row["midia_url"] or "",
+                "midia_url": _url_item_portfolio(row["midia_url"], row["item_id"], artista_id),
+                "arquivo_nome": row["arquivo_nome"],
+                "arquivo_mime": row["arquivo_mime"],
+                "arquivo_tamanho": row["arquivo_tamanho"],
+                "secao": row["secao"] or "portfolio",
+                "capa_url": _url_item_portfolio(row["capa_url"], row["item_id"], artista_id, capa=True),
             })
         return {"portfolio": items}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Não foi possível carregar o portfólio.")
+    except PortfolioStorageError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+    except Exception as error:
+        raise _erro_banco_portfolio(error, "Não foi possível carregar o portfólio.") from None
     finally:
         if cursor: cursor.close()
         if conexao: conexao.close()
@@ -1633,9 +1675,13 @@ def listar_meu_portfolio(current_user: dict = Depends(get_usuario_atual)):
 
 @app.post("/api/artistas/portfolio", tags=["Artista"])
 def criar_item_portfolio(item: PortfolioCreate, current_user: dict = Depends(get_usuario_atual)):
+    """Preserva a criação JSON de itens de texto, sem exigir Supabase."""
     conexao = None
     cursor = None
     try:
+        titulo = item.titulo.strip()
+        if not titulo:
+            raise HTTPException(status_code=400, detail="Informe o título do trabalho.")
         conexao = get_db_connection()
         cursor = conexao.cursor(dictionary=True)
         artista_id = int(current_user["id"])
@@ -1645,24 +1691,178 @@ def criar_item_portfolio(item: PortfolioCreate, current_user: dict = Depends(get
         cursor.execute("""
             INSERT INTO portfolios (artista_id, titulo, descricao, tipo, ordem, publicado)
             VALUES (%s, %s, %s, 'projeto', 0, TRUE)
-        """, (artista_id, item.titulo.strip(), item.descricao))
+        """, (artista_id, titulo, item.descricao))
         portfolio_id = cursor.lastrowid
         cursor.execute("""
             INSERT INTO itens_portfolio (portfolio_id, tipo_midia, midia_url, titulo, descricao, ordem)
             VALUES (%s, 'texto', 'texto://', %s, %s, 0)
-        """, (portfolio_id, item.titulo.strip(), item.descricao))
+        """, (portfolio_id, titulo, item.descricao))
+        item_id = cursor.lastrowid
         conexao.commit()
-        return {"status": "sucesso", "id": portfolio_id, "titulo": item.titulo.strip(), "descricao": item.descricao or "", "tipo": "texto", "midia_url": "texto://"}
+        return {
+            "status": "sucesso", "id": portfolio_id, "portfolio_id": portfolio_id,
+            "item_id": item_id, "titulo": titulo, "descricao": item.descricao or "",
+            "tipo": "texto", "midia_url": "texto://", "secao": "portfolio", "capa_url": "",
+            "arquivo_nome": None, "arquivo_mime": None, "arquivo_tamanho": None,
+        }
     except HTTPException:
-        if conexao: conexao.rollback()
+        _rollback_portfolio(conexao)
         raise
-    except Exception:
-        if conexao: conexao.rollback()
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Não foi possível salvar o item do portfólio.")
+    except Exception as error:
+        _rollback_portfolio(conexao)
+        raise _erro_banco_portfolio(error, "Não foi possível salvar o item do portfólio.") from None
     finally:
         if cursor: cursor.close()
         if conexao: conexao.close()
+
+
+@app.post("/api/artistas/portfolio/arquivo", tags=["Artista"])
+def criar_arquivo_portfolio(
+    titulo: str = Form(..., min_length=1, max_length=150),
+    descricao: str = Form("", max_length=300),
+    secao: str = Form("portfolio"),
+    arquivo: UploadFile = File(...),
+    capa: Optional[UploadFile] = File(None),
+    current_user: dict = Depends(get_usuario_atual),
+):
+    """Envia a mídia para a pasta do usuário e publica seus metadados no MySQL."""
+    conexao = None
+    cursor = None
+    storage = None
+    enviados = []
+    commit_iniciado = False
+    try:
+        titulo = titulo.strip()
+        descricao = descricao.strip()
+        if not titulo:
+            raise HTTPException(status_code=400, detail="Informe o título do trabalho.")
+        if secao not in ("portfolio", "video"):
+            raise HTTPException(status_code=400, detail="Seção de portfólio inválida.")
+        artista_id = int(current_user["id"])
+        conexao = get_db_connection()
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute("SELECT usuario_id FROM perfis_artista WHERE usuario_id = %s", (artista_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="É necessário ter um perfil de artista.")
+        # Detecta migração ausente antes de enviar qualquer arquivo para a nuvem.
+        cursor.execute("SELECT arquivo_nome, arquivo_mime, arquivo_tamanho, secao, capa_url FROM itens_portfolio LIMIT 0")
+        cursor.fetchall()
+        storage = SupabasePortfolioStorage()
+        metadata = validar_arquivo_portfolio(arquivo, storage.config.max_bytes)
+        if secao == "video" and metadata.tipo != "video":
+            raise HTTPException(status_code=415, detail="Selecione um vídeo MP4, MOV ou WebM.")
+        metadata_capa = None
+        if capa is not None:
+            if metadata.tipo != "video":
+                raise HTTPException(status_code=400, detail="Uma capa só pode acompanhar um vídeo.")
+            metadata_capa = validar_arquivo_portfolio(capa, min(10 * 1024 * 1024, storage.config.max_bytes))
+            if metadata_capa.tipo != "imagem":
+                raise HTTPException(status_code=415, detail="A capa do vídeo deve ser uma imagem JPG, PNG, GIF ou WebP.")
+        storage.verificar_bucket_privado()
+        caminho = criar_caminho(artista_id, metadata.extensao)
+        storage.upload(caminho, arquivo, metadata)
+        enviados.append(caminho)
+        capa_referencia = None
+        if metadata_capa is not None:
+            caminho_capa = criar_caminho(artista_id, metadata_capa.extensao)
+            storage.upload(caminho_capa, capa, metadata_capa)
+            enviados.append(caminho_capa)
+            capa_referencia = referencia_storage(storage.config.bucket, caminho_capa)
+        cursor.execute("""
+            INSERT INTO portfolios (artista_id, titulo, descricao, tipo, ordem, publicado)
+            VALUES (%s, %s, %s, 'projeto', 0, TRUE)
+        """, (artista_id, titulo, descricao))
+        portfolio_id = cursor.lastrowid
+        cursor.execute("""
+            INSERT INTO itens_portfolio
+                (portfolio_id, tipo_midia, midia_url, titulo, descricao, ordem,
+                 arquivo_nome, arquivo_mime, arquivo_tamanho, secao, capa_url)
+            VALUES (%s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+        """, (
+            portfolio_id, metadata.tipo, referencia_storage(storage.config.bucket, caminho),
+            titulo, descricao, metadata.nome, metadata.mime, metadata.tamanho, secao, capa_referencia,
+        ))
+        item_id = cursor.lastrowid
+        commit_iniciado = True
+        conexao.commit()
+        return {
+            "status": "sucesso", "id": portfolio_id, "portfolio_id": portfolio_id,
+            "item_id": item_id, "titulo": titulo, "descricao": descricao,
+            "tipo": metadata.tipo, "midia_url": f"/api/portfolio/arquivos/{item_id}",
+            "arquivo_nome": metadata.nome, "arquivo_mime": metadata.mime,
+            "arquivo_tamanho": metadata.tamanho, "secao": secao,
+            "capa_url": f"/api/portfolio/arquivos/{item_id}/capa" if capa_referencia else "",
+        }
+    except Exception as error:
+        _rollback_portfolio(conexao)
+        if enviados and storage is not None:
+            if commit_iniciado:
+                # Uma perda de conexão durante COMMIT não prova que ele falhou.
+                # Não apagar a mídia de um registro que pode já ter sido gravado.
+                logger.error("Confirmação de publicação incerta; conferir portfólio antes de reenviar.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Não foi possível confirmar a publicação. Atualize o portfólio antes de tentar novamente.",
+                ) from None
+            try:
+                storage.delete(enviados)
+            except PortfolioStorageError:
+                # A referência interna permite limpeza administrativa sem expor credenciais.
+                logger.error("Limpeza pendente de upload sem publicação: bucket=%s caminhos=%s", storage.config.bucket, ",".join(enviados))
+        if isinstance(error, HTTPException):
+            raise
+        if isinstance(error, PortfolioStorageError):
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+        raise _erro_banco_portfolio(error, "Não foi possível salvar o arquivo do portfólio.") from None
+    finally:
+        if cursor: cursor.close()
+        if conexao: conexao.close()
+
+
+def _abrir_arquivo_portfolio(item_id: int, capa=False):
+    conexao = None
+    cursor = None
+    try:
+        conexao = get_db_connection()
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT i.midia_url, i.capa_url, p.artista_id
+            FROM itens_portfolio i
+            INNER JOIN portfolios p ON p.id = i.portfolio_id
+            WHERE i.id = %s AND p.publicado = TRUE
+        """, (item_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
+        referencia = ler_referencia((row["capa_url"] if capa else row["midia_url"]) or "", row["artista_id"])
+        if not referencia:
+            raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
+        bucket, caminho = referencia
+        storage = SupabasePortfolioStorage()
+        if bucket != storage.config.bucket:
+            raise HTTPException(status_code=503, detail="O bucket configurado não corresponde ao arquivo deste portfólio.")
+        storage.verificar_bucket_privado()
+        url = storage.signed_url(caminho)
+        return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+    except HTTPException:
+        raise
+    except PortfolioStorageError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+    except Exception as error:
+        raise _erro_banco_portfolio(error, "Não foi possível abrir o arquivo do portfólio.") from None
+    finally:
+        if cursor: cursor.close()
+        if conexao: conexao.close()
+
+
+@app.get("/api/portfolio/arquivos/{item_id}", tags=["Artista"])
+def abrir_arquivo_portfolio(item_id: int):
+    return _abrir_arquivo_portfolio(item_id)
+
+
+@app.get("/api/portfolio/arquivos/{item_id}/capa", tags=["Artista"])
+def abrir_capa_portfolio(item_id: int):
+    return _abrir_arquivo_portfolio(item_id, capa=True)
 
 
 @app.delete("/api/artistas/portfolio/{portfolio_id}", tags=["Artista"])
@@ -1670,20 +1870,39 @@ def excluir_item_portfolio(portfolio_id: int, current_user: dict = Depends(get_u
     conexao = None
     cursor = None
     try:
+        artista_id = int(current_user["id"])
         conexao = get_db_connection()
         cursor = conexao.cursor(dictionary=True)
-        cursor.execute("DELETE FROM portfolios WHERE id = %s AND artista_id = %s", (portfolio_id, int(current_user["id"])))
-        if cursor.rowcount == 0:
+        cursor.execute("SELECT id FROM portfolios WHERE id = %s AND artista_id = %s FOR UPDATE", (portfolio_id, artista_id))
+        if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Item não encontrado.")
+        cursor.execute("SELECT midia_url, capa_url FROM itens_portfolio WHERE portfolio_id = %s", (portfolio_id,))
+        referencias = []
+        for row in cursor.fetchall():
+            for valor in (row["midia_url"], row["capa_url"]):
+                referencia = ler_referencia(valor or "", artista_id)
+                if referencia:
+                    referencias.append(referencia)
+        if referencias:
+            storage = SupabasePortfolioStorage()
+            # Valida todos os arquivos antes de apagar qualquer um deles.
+            if any(bucket != storage.config.bucket for bucket, _ in referencias):
+                raise HTTPException(status_code=503, detail="O bucket configurado não corresponde ao arquivo deste portfólio.")
+            # Se o Storage falhar, o registro continua disponível para nova tentativa.
+            # A remoção de objetos já ausentes é idempotente no endpoint do Supabase.
+            storage.delete([caminho for _, caminho in referencias])
+        cursor.execute("DELETE FROM portfolios WHERE id = %s AND artista_id = %s", (portfolio_id, artista_id))
         conexao.commit()
         return {"status": "sucesso"}
     except HTTPException:
-        if conexao: conexao.rollback()
+        _rollback_portfolio(conexao)
         raise
-    except Exception:
-        if conexao: conexao.rollback()
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Não foi possível excluir o item do portfólio.")
+    except PortfolioStorageError as error:
+        _rollback_portfolio(conexao)
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+    except Exception as error:
+        _rollback_portfolio(conexao)
+        raise _erro_banco_portfolio(error, "Não foi possível excluir o item do portfólio.") from None
     finally:
         if cursor: cursor.close()
         if conexao: conexao.close()
